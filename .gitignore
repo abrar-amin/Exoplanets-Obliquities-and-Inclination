@@ -15,5 +15,7 @@ env/
 *.swo
 *~
 examples/
+output*/
 *.cfg
 *.png
+*.npy
