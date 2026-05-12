@@ -16,3 +16,4 @@ env/
 *~
 examples/
 *.cfg
+*.png

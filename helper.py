@@ -9,109 +9,372 @@ from jaxoplanet.starry.ylm import Ylm
 from jaxoplanet.starry.light_curves import light_curve
 import scipy.constants as sc
 import scipy.interpolate as spi
-from numba import jit
+from numba import jit, literal_unroll
 
 import pca
 import dummyfit
 import matplotlib.pyplot as plt
 from jaxoplanet.starry.visualization import show_surface
 
-def initsystem(fit, ydeg):
+
+def initsystem(fit, ydeg, y=None):
     '''
-    Uses a fit object to build the respective starry objects. Useful
-    because starry objects cannot be pickled. Returns a tuple of
-    (star, planet, system).
+    Uses a fit object to build the respective jaxoplanet objects. Useful
+    because jaxoplanet objects cannot be pickled. Returns a tuple of
+    (star_surface, planet_surface, system).
+
+    Arguments
+    ---------
+    fit: Fit object
+        Fit object with configuration loaded.
+
+    ydeg: int
+        Maximum spherical harmonic degree for the planet map.
+
+    y: 1D array, optional
+        Ylm coefficients for the planet map. If None, a uniform map
+        (Y00=1, all others 0) is used. Y00 is always forced to 1.
     '''
-    
     cfg = fit.cfg
     star_ylm = Ylm.from_dense(jnp.array([1.0]), normalize=False)
 
     star_surface = Surface(
-          y=star_ylm,
-          inc=jnp.pi/2,              # Edge-on inclination
-          period=cfg.star.prot,       # Rotation period in days
-          radius=cfg.star.r,          # Radius in solar radii
-          u=(),                       # No limb darkening
-          normalize=False,            # No normalization
-          amplitude=1.0               # Explicit amplitude
-      )
+        y=star_ylm,
+        inc=jnp.pi/2,
+        period=cfg.star.prot,
+        radius=cfg.star.r,
+        u=(),
+        normalize=False,
+        amplitude=1.0,
+    )
 
-      # Create planet surface with spherical harmonics up to ydeg
-      # Initialize all coefficients to zero except Y_00 = 1.0 (uniform map)
-    n_coeffs = (ydeg + 1)**2
-    planet_ylm_coeffs = jnp.zeros(n_coeffs)
-    planet_ylm_coeffs = planet_ylm_coeffs.at[0].set(1.0)  # Y_00 = 1.0
+    if y is None:
+        n_coeffs = (ydeg + 1)**2
+        planet_ylm_coeffs = jnp.zeros(n_coeffs)
+        planet_ylm_coeffs = planet_ylm_coeffs.at[0].set(1.0)
+    else:
+        planet_ylm_coeffs = jnp.array(y)
+        planet_ylm_coeffs = planet_ylm_coeffs.at[0].set(1.0)
+
     planet_ylm = Ylm.from_dense(planet_ylm_coeffs, normalize=False)
 
     planet_surface = Surface(
         y=planet_ylm,
-        inc=jnp.deg2rad(cfg.planet.inc),     # Inclination in radians
-        period=cfg.planet.prot,               # Rotation period in days
-        radius=cfg.planet.r,                  # Radius in solar radii
-        u=(),                                 # No limb darkening
-        normalize=False,                      # No normalization
-        amplitude=1.0,                        # Explicit amplitude
-        phase=jnp.deg2rad(180)                # Initial rotation phase (theta0)
-      )
-
-      # Create the central star object
-    central = Central(
-        mass=cfg.star.m,      # Solar masses
-        radius=cfg.star.r     # Solar radii
+        inc=jnp.deg2rad(cfg.planet.inc),
+        period=cfg.planet.prot,
+        radius=cfg.planet.r,
+        u=(),
+        normalize=False,
+        amplitude=1.0,
+        phase=jnp.deg2rad(180),
     )
 
-    # Create the system with star as central body
+    central = Central(
+        mass=cfg.star.m,
+        radius=cfg.star.r,
+    )
+
     system = SurfaceSystem(
         central=central,
-        central_surface=star_surface
+        central_surface=star_surface,
     )
 
-      # Add planet to the system
     system = system.add_body(
-        period=cfg.planet.porb,               # Orbital period in days
-        radius=cfg.planet.r,                  # Planet radius in solar radii
-        mass=cfg.planet.m,                    # Planet mass in solar masses
-        inclination=jnp.deg2rad(cfg.planet.inc),  # Orbital inclination
-        eccentricity=cfg.planet.ecc,          # Eccentricity
-        omega_peri=jnp.deg2rad(cfg.planet.w), # Argument of periastron
-        asc_node=jnp.deg2rad(cfg.planet.Omega), # Longitude of ascending node
-        time_transit=cfg.planet.t0,           # Time of transit
-        surface=planet_surface                # Attach the planet surface
-      )
-
-
+        period=cfg.planet.porb,
+        radius=cfg.planet.r,
+        mass=cfg.planet.m,
+        inclination=jnp.deg2rad(cfg.planet.inc),
+        eccentricity=cfg.planet.ecc,
+        omega_peri=jnp.deg2rad(cfg.planet.w),
+        asc_node=jnp.deg2rad(cfg.planet.Omega),
+        time_transit=cfg.planet.t0,
+        surface=planet_surface,
+    )
 
     return star_surface, planet_surface, system
 
 
 def vislon(system, data):
-      import time
-      start_time = time.time()
+    """
+    Determines the range of visible longitudes based on times of observation.
 
-      t = data.t
+    Arguments
+    ---------
+    system: jaxoplanet SurfaceSystem
+        System object with at least one orbiting body.
 
-      # Extract from system
-      planet_surface = system.body_surfaces[0]
-      planet_body = system.bodies[0]
+    data: Dataset object
+        Must contain observation times in data.t.
 
-      porb = planet_body.period
-      prot = planet_surface.period
-      t0 = planet_body.time_transit
-      theta0 = jnp.rad2deg(planet_surface.phase)
+    Returns
+    -------
+    minlon: float
+        Minimum visible longitude, in degrees.
 
-      centlon = theta0 - (t - t0) / prot * 360
-      limb1 = centlon - 90
-      limb2 = centlon + 90
-      limb1 = (limb1 + 180) % 360 - 180
-      limb2 = (limb2 + 180) % 360 - 180
+    maxlon: float
+        Maximum visible longitude, in degrees.
+    """
+    t = data.t
 
-      elapsed = time.time() - start_time
-      print(f"    vislon computation took {elapsed:.3f}s")
+    psurf = system.body_surfaces[0]
+    pbody = system.bodies[0]
 
-      minvislon = float(jnp.min(limb1))
-      maxvislon = float(jnp.max(limb2))
+    prot   = psurf.period
+    t0     = pbody.time_transit
+    theta0 = psurf.phase * 180.0 / np.pi
 
-      return minvislon, maxvislon
+    centlon = theta0 - (t - t0) / prot * 360
+    limb1 = centlon - 90
+    limb2 = centlon + 90
+    limb1 = (limb1 + 180) % 360 - 180
+    limb2 = (limb2 + 180) % 360 - 180
+
+    return np.min(limb1), np.max(limb2)
+
+
+def eval_obliquities(system, t, lmax, y00, n_obl=10):
+    """
+    Compute and plot planet flux light curves for each spherical harmonic (l, m)
+    across a range of obliquity values from 0 to pi.
+
+    One subplot is produced per obliquity value. Within each subplot, each
+    spherical harmonic Y(l,m) is shown as a separate labeled line, with the
+    uniform-map contribution (y00) subtracted so that only the harmonic's
+    contribution to the light curve is shown.
+
+    Arguments
+    ---------
+    system: SurfaceSystem
+        A jaxoplanet SurfaceSystem with a star and planet.
+
+    t: 1D array
+        Times at which to evaluate the light curve.
+
+    lmax: int
+        Maximum spherical harmonic degree.
+
+    y00: 1D array
+        Light curve of a normalized, uniform map (same meaning as in mkcurves).
+
+    n_obl: int
+        Number of obliquity values to sample between 0 and pi (inclusive).
+    """
+    planet_surface = system.body_surfaces[0]
+    planet_body = system.bodies[0]
+    central = system.central
+    central_surface = system.central_surface
+
+    obliquities = np.linspace(0, np.pi, n_obl)
+
+    n_coeffs = (lmax + 1)**2
+    nharm = n_coeffs - 1
+
+    harm_labels = []
+    for l in range(1, lmax + 1):
+        for m in range(-l, l + 1):
+            harm_labels.append(f"Y({l},{m:+d})")
+
+    def make_surface(yval, obl):
+        ylm_coeffs = jnp.zeros(n_coeffs)
+        ylm_coeffs = ylm_coeffs.at[0].set(1.0)
+        ylm_coeffs = ylm_coeffs.at[1:].set(yval)
+        new_ylm = Ylm.from_dense(ylm_coeffs, normalize=False)
+        return Surface(
+            y=new_ylm,
+            inc=planet_surface.inc,
+            period=planet_surface.period,
+            radius=planet_surface.radius,
+            u=(),
+            normalize=False,
+            amplitude=1.0,
+            phase=planet_surface.phase,
+            obl=float(obl),
+        )
+
+    def evalflux_harm(surf):
+        new_system = SurfaceSystem(central=central, central_surface=central_surface)
+        new_system = new_system.add_body(
+            period=planet_body.period,
+            radius=planet_body.radius,
+            mass=planet_body.mass,
+            inclination=planet_body.inclination,
+            eccentricity=planet_body.eccentricity,
+            omega_peri=planet_body.omega_peri,
+            time_transit=planet_body.time_transit,
+            surface=surf,
+        )
+        flux_result = light_curve(new_system, order=20)(t)
+        planetflux = np.array(flux_result.T[1])
+        return planetflux - y00
+
+    all_surfaces = [[None] * nharm for _ in range(n_obl)]
+    all_lcs = np.zeros((n_obl, nharm, len(t)))
+    for oi, obl in enumerate(obliquities):
+        for hi in range(nharm):
+            yval = np.zeros(nharm)
+            yval[hi] = 1.0
+            surf = make_surface(yval, obl)
+            all_surfaces[oi][hi] = surf
+            all_lcs[oi, hi] = evalflux_harm(surf)
+
+    inc_deg = np.rad2deg(float(planet_body.inclination))
+
+    lc_ncols = min(n_obl, 5)
+    lc_nrows = (n_obl + lc_ncols - 1) // lc_ncols
+    fig1, axes1 = plt.subplots(lc_nrows, lc_ncols,
+                               figsize=(4 * lc_ncols, 3 * lc_nrows), squeeze=False)
+    fig1.suptitle(f"Harmonic Light Curves vs Obliquity  |  inc={inc_deg:.1f}°")
+    for oi, obl in enumerate(obliquities):
+        ax = axes1[oi // lc_ncols][oi % lc_ncols]
+        obl_deg = np.rad2deg(float(obl))
+        for hi in range(nharm):
+            ax.plot(t, all_lcs[oi, hi], label=harm_labels[hi])
+        ax.set_title(f"obl={obl_deg:.1f}°")
+        ax.set_xlabel("Time (days)")
+        ax.set_ylabel("ΔFlux")
+        ax.legend(loc='best', fontsize='x-small')
+    for oi in range(n_obl, lc_nrows * lc_ncols):
+        axes1[oi // lc_ncols][oi % lc_ncols].set_visible(False)
+    fig1.tight_layout()
+
+    fig2, axes2 = plt.subplots(nharm, n_obl,
+                               figsize=(2 * n_obl, 2.5 * nharm), squeeze=False)
+    fig2.suptitle(f"Surface Maps  |  inc={inc_deg:.1f}°")
+    for hi in range(nharm):
+        for oi, obl in enumerate(obliquities):
+            ax = axes2[hi][oi]
+            show_surface(all_surfaces[oi][hi], ax=ax, theta=0)
+            if hi == 0:
+                obl_deg = np.rad2deg(float(obl))
+                ax.set_title(f"obl={obl_deg:.1f}°", fontsize=7)
+            if oi == 0:
+                ax.set_ylabel(harm_labels[hi], fontsize=7)
+    fig2.tight_layout()
+
+    plt.show()
+
+
+def eval_inclination(system, t, lmax, y00, n_inclinations=10):
+    """
+    Compute and plot planet flux light curves for each spherical harmonic (l, m)
+    across a range of inclination values from pi/2 to 3*pi/2.
+
+    One subplot is produced per inclination value. Within each subplot, each
+    spherical harmonic Y(l,m) is shown as a separate labeled line, with the
+    uniform-map contribution (y00) subtracted so that only the harmonic's
+    contribution to the light curve is shown.
+
+    Arguments
+    ---------
+    system: SurfaceSystem
+        A jaxoplanet SurfaceSystem with a star and planet.
+
+    t: 1D array
+        Times at which to evaluate the light curve.
+
+    lmax: int
+        Maximum spherical harmonic degree.
+
+    y00: 1D array
+        Light curve of a normalized, uniform map (same meaning as in mkcurves).
+
+    n_inclinations: int
+        Number of inclination values to sample between pi/2 and 3*pi/2 (inclusive).
+    """
+    planet_surface = system.body_surfaces[0]
+    planet_body = system.bodies[0]
+    central = system.central
+    central_surface = system.central_surface
+
+    inclinations = np.linspace(np.pi / 2, 3 * np.pi / 2, n_inclinations)
+
+    n_coeffs = (lmax + 1)**2
+    nharm = n_coeffs - 1
+
+    harm_labels = []
+    for l in range(1, lmax + 1):
+        for m in range(-l, l + 1):
+            harm_labels.append(f"Y({l},{m:+d})")
+
+    def make_surface(yval, incline):
+        ylm_coeffs = jnp.zeros(n_coeffs)
+        ylm_coeffs = ylm_coeffs.at[0].set(1.0)
+        ylm_coeffs = ylm_coeffs.at[1:].set(yval)
+        new_ylm = Ylm.from_dense(ylm_coeffs, normalize=False)
+        return Surface(
+            y=new_ylm,
+            inc=incline,
+            period=planet_surface.period,
+            radius=planet_surface.radius,
+            u=(),
+            normalize=False,
+            amplitude=1.0,
+            phase=planet_surface.phase,
+            obl=planet_surface.obl,
+        )
+
+    def evalflux_harm(surf):
+        new_system = SurfaceSystem(central=central, central_surface=central_surface)
+        new_system = new_system.add_body(
+            period=planet_body.period,
+            radius=planet_body.radius,
+            mass=planet_body.mass,
+            inclination=planet_body.inclination,
+            eccentricity=planet_body.eccentricity,
+            omega_peri=planet_body.omega_peri,
+            time_transit=planet_body.time_transit,
+            surface=surf,
+        )
+        flux_result = light_curve(new_system, order=20)(t)
+        planetflux = np.array(flux_result.T[1])
+        return planetflux - y00
+
+    all_surfaces = [[None] * nharm for _ in range(n_inclinations)]
+    all_lcs = np.zeros((n_inclinations, nharm, len(t)))
+    for ii, inc in enumerate(inclinations):
+        for hi in range(nharm):
+            yval = np.zeros(nharm)
+            yval[hi] = 1.0
+            surf = make_surface(yval, inc)
+            all_surfaces[ii][hi] = surf
+            all_lcs[ii, hi] = evalflux_harm(surf)
+
+    obl_deg = np.rad2deg(float(planet_surface.obl))
+
+    lc_ncols = min(n_inclinations, 5)
+    lc_nrows = (n_inclinations + lc_ncols - 1) // lc_ncols
+    fig1, axes1 = plt.subplots(lc_nrows, lc_ncols,
+                               figsize=(4 * lc_ncols, 3 * lc_nrows), squeeze=False)
+    fig1.suptitle(f"Harmonic Light Curves vs Inclination  |  obl={obl_deg:.1f}°")
+    for ii, inc in enumerate(inclinations):
+        ax = axes1[ii // lc_ncols][ii % lc_ncols]
+        inc_deg = np.rad2deg(float(inc))
+        for hi in range(nharm):
+            ax.plot(t, all_lcs[ii, hi], label=harm_labels[hi])
+        ax.set_title(f"inc={inc_deg:.1f}°")
+        ax.set_xlabel("Time (days)")
+        ax.set_ylabel("ΔFlux")
+        ax.legend(loc='best', fontsize='x-small')
+    for ii in range(n_inclinations, lc_nrows * lc_ncols):
+        axes1[ii // lc_ncols][ii % lc_ncols].set_visible(False)
+    fig1.tight_layout()
+
+    fig2, axes2 = plt.subplots(nharm, n_inclinations,
+                               figsize=(2 * n_inclinations, 2.5 * nharm), squeeze=False)
+    fig2.suptitle(f"Surface Maps  |  obl={obl_deg:.1f}°")
+    for hi in range(nharm):
+        for ii, inc in enumerate(inclinations):
+            ax = axes2[hi][ii]
+            show_surface(all_surfaces[ii][hi], ax=ax, theta=0)
+            if hi == 0:
+                inc_deg = np.rad2deg(float(inc))
+                ax.set_title(f"inc={inc_deg:.1f}°", fontsize=7)
+            if ii == 0:
+                ax.set_ylabel(harm_labels[hi], fontsize=7)
+    fig2.tight_layout()
+
+    plt.show()
+
 
 def mkcurves(system, t, lmax, y00, ncurves=None, method='pca',
              orbcheck=None, sigorb=None):
@@ -121,38 +384,41 @@ def mkcurves(system, t, lmax, y00, ncurves=None, method='pca',
 
     Arguments
     ---------
-    system: object
-        A starry system object, initialized with a star and a planet
+    system: SurfaceSystem
+        A jaxoplanet SurfaceSystem with a star and planet.
 
     t: 1D array
-        Array of times at which to calculate eigencurves
+        Array of times at which to calculate eigencurves.
 
-    lmax: integer
-        Maximum l to use in spherical harmonic maps
+    lmax: int
+        Maximum l to use in spherical harmonic maps.
 
     y00: 1D array
-        Light curve of a normalized, uniform map
+        Light curve of a normalized, uniform map.
+
+    ncurves: int, optional
+        Number of eigencurves to compute. Defaults to all.
+
+    method: str
+        PCA method, 'pca' or 'tsvd'.
 
     Returns
     -------
     eigeny: 2D array
-        nharm x ny array of y coefficients for each harmonic. nharm is
-        the number of harmonics, including positive and negative versions
-        and excluding Y00. That is, 2 * ((lmax + 1)**2 - 1). ny is the
-        number of y coefficients to describe a harmonic with degree lmax.
-        That is, (lmax + 1)**2.
+        ncurves x (lmax+1)**2 array of Ylm coefficients for each eigenmap.
 
     evalues: 1D array
-        nharm length array of eigenvalues
+        Eigenvalues from PCA.
 
     evectors: 2D array
-        nharm x nt array of normalized (unit) eigenvectors
+        Eigenvectors from PCA.
 
     proj: 2D array
-        nharm x nt array of the data projected in the new space (the PCA
-        "eigencurves"). The imaginary part is discarded, if nonzero.
+        Data projected into the PCA eigenbasis (eigencurves).
+
+    lcs: 2D array
+        Raw harmonic light curves before PCA.
     """
-    # Get planet surface from system
     planet_surface = system.body_surfaces[0]
     planet_body = system.bodies[0]
     central = system.central
@@ -160,25 +426,9 @@ def mkcurves(system, t, lmax, y00, ncurves=None, method='pca',
 
     nt = len(t)
 
-    # Jaxoplanet function to evaluate flux with modified Ylm coefficients
-    def evalflux(yval, track_time=False):
-        """
-        Compute light curve for given Ylm coefficients.
-        yval is array of coefficients (excluding Y00).
-        Returns star flux and planet flux separately.
-        """
-        import time
-        if track_time:
-            sys_start = time.time()
-
-        # Create full Ylm coefficient array (including Y00 = 1)
-        n_coeffs = (lmax + 1)**2
-        ylm_coeffs = jnp.zeros(n_coeffs)
-        ylm_coeffs = ylm_coeffs.at[0].set(1.0)  # Y00 = 1 (uniform)
-        ylm_coeffs = ylm_coeffs.at[1:].set(yval)  # Higher order terms
-        # Create new Ylm with these coefficients (no normalization to match STARRY)
-        new_ylm = Ylm.from_dense(ylm_coeffs, normalize=False)
-        # Create new planet surface with updated Ylm
+    def calcflux(y):
+        """Compute planet flux for given full Ylm coefficient array (including Y00)."""
+        new_ylm = Ylm.from_dense(y, normalize=False)
         new_planet_surface = Surface(
             y=new_ylm,
             inc=planet_surface.inc,
@@ -188,16 +438,8 @@ def mkcurves(system, t, lmax, y00, ncurves=None, method='pca',
             normalize=False,
             amplitude=1.0,
             phase=planet_surface.phase,
-            obl= 3.14/2
         )
-
-        # Create new system directly (like initsystem)
-        new_system = SurfaceSystem(
-            central=central,
-            central_surface=central_surface
-        )
-
-        # Add planet to the system with the new surface
+        new_system = SurfaceSystem(central=central, central_surface=central_surface)
         new_system = new_system.add_body(
             period=planet_body.period,
             radius=planet_body.radius,
@@ -206,357 +448,162 @@ def mkcurves(system, t, lmax, y00, ncurves=None, method='pca',
             eccentricity=planet_body.eccentricity,
             omega_peri=planet_body.omega_peri,
             time_transit=planet_body.time_transit,
-            surface=new_planet_surface
+            surface=new_planet_surface,
         )
-        print(planet_body.eccentricity)
-        if track_time:
-            sys_time = time.time() - sys_start
-            lc_start = time.time()
+        flux_result = light_curve(new_system, order=100)(t)
+        return flux_result.T[0], flux_result.T[1]
 
-        # Compute light curve - returns array with shape (n_bodies, n_times)
-        print(t)
+    j_calcflux = jax.jit(calcflux)
 
-
-        flux_result = light_curve(new_system, order=20)(t)
-        if track_time:
-            lc_time = time.time() - lc_start
-            print(f"    [evalflux breakdown] System creation: {sys_time:.3f}s, Light curve eval: {lc_time:.3f}s")
-
-        # Extract star and planet fluxes
-        # flux_result.T[0] is star, flux_result.T[1] is planet
-        starflux = np.array(flux_result.T[0])
-        planetflux = np.array(flux_result.T[1])
-        print(ylm_coeffs)
-        print(planetflux)
-        print("------")
-        print(starflux)
-        plt.plot(t, planetflux)
-        plt.plot(t, y00)
-        plt.plot(t, planetflux -y00)
-
-
-   
-            #circle = plt.Circle((x, y), radius_ratio, color="k", fill=True, zorder=10)
-        fig,ax = plt.subplots()
-        show_surface(new_planet_surface, ax=ax, theta=0)
-
-        plt.show()
-
-
-        return starflux, planetflux
-
-    # Create harmonic maps of the planet, excluding Y00
-    # (lmax**2 maps, plus a negative version for all but Y00)
     nharm = 2 * ((lmax + 1)**2 - 1)
     lcs = np.zeros((nharm, nt))
     ilc = 0
 
-    import time
-    print(f"Computing {nharm} light curves for lmax={lmax} at {nt} time points...")
-    start_time = time.time()
+    for l in range(1, lmax + 1):
+        for m in range(-l, l + 1):
+            y = np.zeros((lmax + 1)**2)
+            y[0] = 1.0
+            y[1 + ilc // 2] = 1.0
 
-    # Track time spent in different parts
-    system_creation_time = 0.0
-    light_curve_eval_time = 0.0
-
-    for i, l in enumerate(range(1, lmax + 1)):
-        for j, m in enumerate(range(-l, l + 1)):
-            # Create array of Ylm coefficients (excluding Y00)
-            yval = np.zeros(nharm // 2)
-
-            # Set this specific harmonic to +1.0
-            yval[ilc // 2] = 1.0
-            lc_start = time.time()
-            # Track detailed timing for the first light curve
-            track = (ilc == 0)
-            sflux, lcs[ilc] = evalflux(yval, track_time=track)
-            lc_time = time.time() - lc_start
-
-            # Set this specific harmonic to -1.0
-            yval[ilc // 2] = -1.0
-            sflux, lcs[ilc+1] = evalflux(yval, track_time=False)
+            _, pflux = j_calcflux(jnp.array(y))
+            lcs[ilc] = np.array(pflux) - y00
+            # Negate to get the -1 harmonic without an extra evaluation
+            lcs[ilc + 1] = -1.0 * lcs[ilc]
             ilc += 2
 
-            if (ilc // 2) % 5 == 0 or ilc == 2:
-                print(f"  Computed light curves {ilc-1}/{nharm} (last pair took {lc_time:.3f}s)")
-
-    total_time = time.time() - start_time
-    print(f"Total light curve computation time: {total_time:.2f}s ({total_time/nharm:.3f}s per curve)")
-
-    # If user wants to include additional eigencurves which explore
-    # different orbital parameters
     if orbcheck is not None:
-        # TODO: Implement orbcheck for jaxoplanet
-        # For now, skip this feature
         print("Warning: orbcheck not yet implemented for jaxoplanet, skipping...")
 
-    # Subtract uniform map contribution (jaxoplanet includes this in all light curves)
-    print("Before: " + str(lcs))
-    lcs -= y00
-    
-    # Additional correction: remove any remaining DC offset from each light curve
-    # JAXOPLANET and STARRY compute harmonic contributions slightly differently.
-    # This ensures each harmonic is orthogonal to Y00, matching STARRY's behavior.
-    for i in range(lcs.shape[0]):
-        lcs[i] -= np.mean(lcs[i])
-
-
-    print("After: " + str(lcs))
-
-
-    # Run PCA to determine orthogonal light curves
     if ncurves is None:
         ncurves = nharm
         if method == 'tsvd':
             ncurves -= 1
 
-    print(f"Running PCA with method={method}, ncurves={ncurves}...")
-    pca_start = time.time()
     evalues, evectors, proj = pca.pca(lcs, method=method, ncomp=ncurves)
-    pca_time = time.time() - pca_start
-    print(f"  PCA computation took {pca_time:.3f}s")
-
-    # Discard imaginary part of eigencurves to appease numpy
     proj = np.real(proj)
 
-    # Convert orthogonal light curves into maps
-    print(f"Converting eigenvectors to eigenmap coefficients...")
-    conv_start = time.time()
     eigeny = np.zeros((ncurves, (lmax + 1)**2))
-    eigeny[:,0] = 1.0 # Y00 = 1 for all maps
+    eigeny[:, 0] = 1.0
     for j in range(ncurves):
         yi  = 1
         shi = 0
         for l in range(1, lmax + 1):
             for m in range(-l, l + 1):
-                # (ok because evectors has only been sorted along
-                #  one dimension)
-                eigeny[j,yi] = evectors.T[j,shi] - evectors.T[j,shi+1]
+                eigeny[j, yi] = evectors.T[j, shi] - evectors.T[j, shi + 1]
                 yi  += 1
                 shi += 2
-    conv_time = time.time() - conv_start
-    print(f"  Eigenmap conversion took {conv_time:.3f}s")
-
-
-    #for i in range (proj.shape[0]):
-     #   plt.plot(proj[i])
-      #  print(proj[i])
-       # plt.xlabel("Jax")
-       # plt.show()
 
     return eigeny, evalues, evectors, proj, lcs
 
 
 def intensities(fit, data, ln):
-    # We reinitialize the planet object here because the yval
-    # assignments in the mkcurves theano function are tracked, so if
-    # we don't pass that yval into the theano function here (and why
-    # would we), theano gets confused as it runs through those
-    # assignments in the graph. Perhaps there's a more elegant
-    # solution.
-    import time
+    """
+    Compute eigenmap intensities at all visible grid cells.
 
-    print(f"  Reinitializing system for intensities computation...")
-    init_start = time.time()
-    star_surface, planet_surface, system = initsystem(fit, ln.lmax)
-    init_time = time.time() - init_start
-    print(f"    System reinitialization took {init_time:.3f}s")
+    Arguments
+    ---------
+    fit: Fit object
+    data: Dataset object
+    ln: LN object with lmax, ncurves, eigeny attributes.
 
-    grid_start = time.time()
+    Returns
+    -------
+    intens: 2D array
+        (ncurves x nloc) intensities, with uniform-map contribution removed.
+
+    vislat: 1D array
+        Visible latitudes in radians.
+
+    vislon: 1D array
+        Visible longitudes in radians.
+    """
     wherevis = np.where((np.array(fit.lon) + fit.dlon >= data.minvislon) &
                         (np.array(fit.lon) - fit.dlon <= data.maxvislon))
 
     vislon = jnp.deg2rad(np.array(fit.lon[wherevis].flatten()))
     vislat = jnp.deg2rad(np.array(fit.lat[wherevis].flatten()))
-
     nloc = len(vislon)
-    grid_time = time.time() - grid_start
-    print(f"    Visible grid calculation took {grid_time:.3f}s")
 
     intens = np.zeros((ln.ncurves, nloc))
 
+    _, ref_planet, _ = initsystem(fit, ln.lmax)
+    ref_intensity = np.array(ref_planet.intensity(vislat, vislon))
+
     def evalintensity(yval):
-        # Create full Ylm coefficient array (including Y00 = 1)
-        n_coeffs = (ln.lmax + 1)**2
-        ylm_coeffs = jnp.zeros(n_coeffs)
-        ylm_coeffs = ylm_coeffs.at[0].set(1.0)  # Y00 = 1 (uniform)
-        ylm_coeffs = ylm_coeffs.at[1:].set(yval)  # Higher order terms
+        new_ylm = Ylm.from_dense(yval, normalize=False)
+        new_surface = Surface(
+            y=new_ylm,
+            inc=ref_planet.inc,
+            period=ref_planet.period,
+            radius=ref_planet.radius,
+            u=(),
+            normalize=False,
+            amplitude=1.0,
+            phase=ref_planet.phase,
+        )
+        return new_surface.intensity(vislat, vislon)
 
-        # Use normalize=False to match how eigenmaps were created in mkcurves
-        new_ylm = Ylm.from_dense(ylm_coeffs, normalize=False)
-        new_planet_surface = Surface(
-                    y=new_ylm,
-                    inc=planet_surface.inc,
-                    period=planet_surface.period,
-                    radius=planet_surface.radius,
-                    u=(),
-                    normalize=False,
-                    amplitude=1.0,
-                    phase=planet_surface.phase
-                )
-        intensity  = new_planet_surface.intensity(vislat, vislon)
-        uniform_ylm = Ylm.from_dense(jnp.array([1.0]), normalize=False)
-        uniform_surface = Surface(
-              y=uniform_ylm,
-              inc=planet_surface.inc,
-              period=planet_surface.period,
-              radius=planet_surface.radius,
-              u=(),
-              normalize=False,
-              amplitude=1.0,
-              phase=planet_surface.phase
-          )
-        intensity -= uniform_surface.intensity(vislat, vislon)
-
-        return intensity
-
-
-    # JIT compile for speed (replaces Theano compilation)
-    print(f"  Computing intensities for {ln.ncurves} eigenmaps at {nloc} visible locations...")
-    start_time = time.time()
-
-    jit_start = time.time()
     evalintensity_jit = jax.jit(evalintensity)
-    jit_setup_time = time.time() - jit_start
-    print(f"    JIT setup took {jit_setup_time:.3f}s")
 
-    # Compute intensity for each eigenmap
-    compile_time = 0.0
     for k in range(ln.ncurves):
-        intens_start = time.time()
-        intens[k] = np.array(evalintensity_jit(jnp.array(ln.eigeny[k, 1:])))
-        intens_time = time.time() - intens_start
-        if k == 0:
-            compile_time = intens_time
-            print(f"    First eigenmap (with JIT compilation): {compile_time:.3f}s")
-        elif k == 1:
-            print(f"    Second eigenmap (JIT compiled): {intens_time:.4f}s")
-
-    total_time = time.time() - start_time
-    avg_time = (total_time - compile_time) / max(1, ln.ncurves - 1) if ln.ncurves > 1 else 0
-    print(f"  Total intensity computation time: {total_time:.2f}s (avg {avg_time:.4f}s per eigenmap after JIT)")
+        intens[k] = np.array(evalintensity_jit(jnp.array(ln.eigeny[k]))) - ref_intensity
 
     return intens, vislat, vislon
 
-def mkmaps(planet_surface, eigeny, params, ncurves, wl, rs, rp, ts, lat, lon,
-           starspec='bb', fwl=None, ftrans=None, swl=None, sspec=None):
+
+def mkmaps(fit, m, ln, params):
     """
-    Calculate flux map and brightness temperature map from
-    a single 2D map fit.
+    Calculate flux map and brightness temperature map from a single 2D map fit.
 
     Arguments
     ---------
-    planet_surface: Surface object
-        Planet surface object from jaxoplanet. Will not be modified.
+    fit: Fit object
+        Must have fit.lat, fit.lon (in degrees), fit.cfg.
 
-    eigeny: 2D array
-        Eigenvalues for the eigenmaps that form the basis for the
-        2D fit.
+    m: Map object
+        Must have m.wlmid, m.filtwl, m.filttrans.
+
+    ln: LN object
+        Must have ln.lmax, ln.ncurves, ln.eigeny.
 
     params: 1D array
-        Best-fitting parameters.
-
-    ncurves: int
-        Number of eigencurves (or eigenmaps) included in the total map.
-
-    wl: 1D array
-        The wavelength of the 2D map, in microns.
-
-    rs: float
-        Radius of the star (same units as rp)
-
-    rp: float
-        radius of the planet (same units as rs)
-
-    ts: float
-        Temperature of the star in Kelvin
-
-    lat: 2d array
-        Latitudes of grid to calculate map (in radians)
-
-    lon: 2d array
-        Longitudes of grid to calculate map (in radians)
+        Best-fitting parameters. params[:ncurves] are eigenmap weights,
+        params[ncurves] is the uniform component amplitude, and
+        params[ncurves+1] is the stellar correction term.
 
     Returns
     -------
-    fmap: 1D/2D array
-        Array with shape matching lat and lon of planetary emission at
-        each wavelength and location
+    fmap: 2D array
+        Planet flux map, same shape as fit.lat.
 
-    tmap: 1D/2D array
-        Same as fmap but for brightness temperature.
+    tmap: 2D array
+        Brightness temperature map, same shape as fit.lat.
     """
-    import time
-    start_time = time.time()
+    yval = np.zeros((ln.lmax + 1)**2)
+    yval[0] = 1.0
+    for j in range(ln.ncurves):
+        yval[1:] += params[j] * ln.eigeny[j, 1:]
 
-    fmap = np.zeros(lat.shape) # flux maps
-    tmap = np.zeros(lat.shape) # temp maps
+    _, planet, _ = initsystem(fit, ln.lmax, y=yval)
 
-    # Infer lmax from eigeny shape
-    lmax = int(np.sqrt(eigeny.shape[1])) - 1
-    n_coeffs = (lmax + 1)**2
+    fmap = np.array(planet.intensity(np.deg2rad(fit.lat),
+                                     np.deg2rad(fit.lon)))
 
-    print(f"Creating flux and temperature maps (grid: {lat.shape}, lmax={lmax}, ncurves={ncurves})...")
+    # Replace default Y00=1 uniform contribution with the fitted amplitude
+    fmap += (params[ln.ncurves] - 1.0) / np.pi
 
-    # Uniform map term (Y00 only, scaled by params[ncurves])
-    uniform_start = time.time()
-    uniform_ylm = Ylm.from_dense(jnp.array([1.0]), normalize=False)
-    uniform_surface = Surface(
-        y=uniform_ylm,
-        inc=planet_surface.inc,
-        period=planet_surface.period,
-        radius=planet_surface.radius,
-        u=(),
-        normalize=False,
-        amplitude=1.0,
-        phase=planet_surface.phase
-    )
-    fmap = np.array(uniform_surface.intensity(lat.flatten(), lon.flatten()).reshape(lat.shape)) * params[ncurves]
-    uniform_time = time.time() - uniform_start
+    swl   = fit.starwl   if hasattr(fit, 'starwl')   else None
+    sspec = fit.starflux if hasattr(fit, 'starflux') else None
 
-    # Combine scaled eigenmap Ylm terms
-    combine_start = time.time()
-    combined_ylm_coeffs = jnp.zeros(n_coeffs)
-    combined_ylm_coeffs = combined_ylm_coeffs.at[0].set(1.0)  # Y00 = 1
-    for i in range(ncurves):
-        combined_ylm_coeffs = combined_ylm_coeffs.at[1:].add(eigeny[i, 1:] * params[i])
-
-    # Create surface with combined coefficients
-    combined_ylm = Ylm.from_dense(combined_ylm_coeffs, normalize=False)
-
-    combined_surface = Surface(
-        y=combined_ylm,
-        inc=planet_surface.inc,
-        period=planet_surface.period,
-        radius=planet_surface.radius,
-        u=(),
-        normalize=False,
-        amplitude=1.0,
-        phase=planet_surface.phase
-    )
-    fmap += np.array(combined_surface.intensity(lat.flatten(), lon.flatten()).reshape(lat.shape))
-
-    # Subtract extra Y00 map that jaxoplanet always includes
-    fmap -= np.array(uniform_surface.intensity(lat.flatten(), lon.flatten()).reshape(lat.shape))
-    combine_time = time.time() - combine_start
-
-    # Convert to brightness temperatures
-    # see Rauscher et al., 2018, Eq. 8
-    tmap_start = time.time()
-    tmap = fmap_to_tmap(fmap, wl, rp, rs, ts,
-                              params[ncurves+1], starspec=starspec,
-                              fwl=fwl, ftrans=ftrans, swl=swl,
-                              sspec=sspec)
-    tmap_time = time.time() - tmap_start
-
-    total_time = time.time() - start_time
-    flux_time = uniform_time + combine_time
-    print(f"  Map creation time: {total_time:.3f}s")
-    print(f"    - Uniform map: {uniform_time:.3f}s")
-    print(f"    - Combined eigenmaps: {combine_time:.3f}s")
-    print(f"    - Temperature conversion: {tmap_time:.3f}s")
+    tmap = fmap_to_tmap(fmap, m.wlmid, fit.cfg.planet.r,
+                        fit.cfg.star.r, fit.cfg.star.t,
+                        params[ln.ncurves + 1],
+                        starspec=fit.cfg.star.starspec,
+                        fwl=m.filtwl, ftrans=m.filttrans,
+                        swl=swl, sspec=sspec)
 
     return fmap, tmap
+
 
 def fmap_to_tmap(fmap, meanwl, rp, rs, ts, scorr, starspec='bb',
                  fwl=None, ftrans=None, swl=None, sspec=None,
@@ -566,51 +613,37 @@ def fmap_to_tmap(fmap, meanwl, rp, rs, ts, scorr, starspec='bb',
     See Rauscher et al., 2018, eq. 8
 
     fmap: 2D array
-        Array of star-normalized planet fluxes
+        Array of star-normalized planet fluxes.
 
-    meanwl: Float
+    meanwl: float
         Mean wavelength of planet fluxes, in microns.
 
-    rp: Float
+    rp: float
         Planet radius. Same units as rs.
 
-    rs: Float
+    rs: float
         Stellar radius. Same units as rp.
 
-    ts: Float
-        Stellar temperature (K)
+    ts: float
+        Stellar temperature in Kelvin.
 
-    scorr: Float
-        Stellar correction term. 
+    scorr: float
+        Stellar correction term.
 
-    starspec: String
-        Three options:
-            'bb' -- Blackbody evaluated at meanwl.
-            'bbint' -- Blackbody, integrated over a filter.
-            'custom' -- Provide stellar spectrum, which will be integrated.
+    starspec: str
+        'bb', 'bbint', or 'custom'.
 
-    fwl: Array
-        Array of filter wavelengths, in microns.
+    fwl, ftrans: arrays
+        Filter wavelengths (microns) and transmission.
 
-    ftrans: Array
-        Array of filter transmission.
+    swl, sspec: arrays
+        Stellar spectrum wavelengths and spectrum.
 
-    swl: Array 
-        Array of stellar spectrum wavelengths, in microns.
-
-    sspec: Array
-        Array of stellar spectrum, same units as the Planck function (mks)
-
-    trange: 1D Array
-        Array of temperatures corresponding to fpfs_bb
-
-    fpfs_bb: 2D array
-        Filter-integrated star-normalized planetary blackbody spectra at each 
-        temperature in trange. Will be used to interpolate to temperatures
-        using fmap. Calculated on the fly if not supplied. This can be
-        very slow.
+    trange, fpfs_bb: arrays
+        Pre-computed temperature grid and corresponding filter-integrated
+        planet-to-star flux ratios for fast interpolation.
     '''
-    meanwl_m = meanwl * 1e-6 # convert to m
+    meanwl_m = meanwl * 1e-6
     ptemp = (sc.h * sc.c) / (meanwl_m * sc.k)
     sfact = 1 + scorr
     if starspec == 'bb':
@@ -618,13 +651,11 @@ def fmap_to_tmap(fmap, meanwl, rp, rs, ts, scorr, starspec='bb',
                               (np.exp(ptemp / ts) - 1) /
                               (np.pi * fmap * sfact))
     elif starspec == 'bbint':
-        if ((fwl is None) or
-            (ftrans is None)):
+        if fwl is None or ftrans is None:
             print('Must specify filter for integrated blackbody.')
-        # Convert units
         fwl_m = fwl * 1e-6
         sbb = 2 * sc.h * sc.c**2 / fwl_m**5 / \
-            (np.exp(sc.h * sc.c / fwl_m / sc.k / ts) -1 )
+            (np.exp(sc.h * sc.c / fwl_m / sc.k / ts) - 1)
         sint = specint(fwl_m, sbb, [fwl_m], [ftrans])
         tmap = ptemp / np.log(1 + (rp / rs)**2 *
                               (2 * sc.h * sc.c**2 / meanwl_m**5) *
@@ -632,40 +663,25 @@ def fmap_to_tmap(fmap, meanwl, rp, rs, ts, scorr, starspec='bb',
                               (1 / (fmap * sfact)) *
                               (1 / sint))
     elif starspec == 'custom':
-        if ((fwl is None) or
-            (ftrans is None) or
-            (sspec is None) or
-            (swl is None)):
+        if fwl is None or ftrans is None or sspec is None or swl is None:
             print('Must specify filter and stellar spectrum.')
-
-        if (trange is None) and (fpfs_bb is not None):
+        if trange is None and fpfs_bb is not None:
             print('Must specify temperatures if supplying fpfs_bb.')
-
-        # Convert units
         fwl_m = fwl * 1e-6
         swl_m = swl * 1e-6
-        
         if fpfs_bb is None:
             sspec_int = np.interp(fwl_m, swl_m, sspec)
-            
             trange = np.linspace(50, 5000, 10000)
             bbs = blackbody_wl(trange, fwl_m)
-            
             sspec_fint = np.trapz(ftrans * sspec_int, fwl_m)
-            
-            # Integrate over the filter throughput
             rprs2 = (rp / rs)**2
             fpfs_spec = rprs2 * bbs / sspec_int
             fpfs_bb = np.trapz(fpfs_spec * ftrans * sspec_int,
                                fwl_m, axis=1) / sspec_fint
-
-        # Function to interpolate fluxes to temperatures
         interp_fpfs = spi.CubicSpline(fpfs_bb, trange)
-
         tmap = interp_fpfs(fmap * np.pi)
-               
-    return tmap
 
+    return tmap
 
 
 def specint(wn, spec, filtwn_list, filttrans_list):
@@ -675,56 +691,47 @@ def specint(wn, spec, filtwn_list, filttrans_list):
     Arguments
     ---------
     wn: 1D array
-        Wavenumbers (/cm) of the spectrum
+        Wavenumbers (/cm) of the spectrum.
 
     spec: 1D array
-        Spectrum to be integrated
+        Spectrum to be integrated.
 
     filtwn_list: list
         List of arrays of filter wavenumbers, in /cm.
 
     filttrans_list: list
-        List of arrays of filter transmission. Same length as filtwn_list.
+        List of arrays of filter transmission.
 
     Returns
     -------
     intspec: 1D array
-        The spectrum integrated over each filter. 
+        The spectrum integrated over each filter.
     """
     if len(filtwn_list) != len(filttrans_list):
         print("ERROR: list sizes do not match.")
         raise Exception
-    
-    intspec = np.zeros(len(filtwn_list)) 
-    
+
+    intspec = np.zeros(len(filtwn_list))
+
     for i, (filtwn, filttrans) in enumerate(zip(filtwn_list, filttrans_list)):
-        # Sort ascending
         idx = np.argsort(filtwn)
-        
         intfunc = spi.interp1d(filtwn[idx], filttrans[idx],
                                bounds_error=False, fill_value=0)
-
-        # Interpolate transmission
         inttrans = intfunc(wn)
-
-        # Normalize to one
         norminttrans = inttrans / np.trapz(inttrans, wn)
-
-        # Integrate filtered spectrum
         intspec[i] = np.trapz(spec * norminttrans, wn)
 
     return intspec
 
+
 def blackbody_wl(T, wl):
     '''
     Calculates the Planck function for a grid of temperatures and
-    wavelengths. Wavelenghts must be in m.
+    wavelengths. Wavelengths must be in m.
     '''
     bb = (2.0 * sc.h * sc.c**2 / (wl[np.newaxis]**5)) \
         * 1 / (np.exp(sc.h * sc.c / wl[np.newaxis] / sc.k / T[:, np.newaxis]) - 1.0)
-    
     return bb
-
 
 
 @jit(nopython=True)
@@ -736,68 +743,49 @@ def fit_2d(params, ecurves, t, y00, sflux, ncurves, intens, pindex,
     Arguments
     ---------
     params: 1D float array
-        Model parameters, including the map parameters and
-        ramp (baseline) parameters.
+        Model parameters: map weights, uniform amplitude, stellar correction,
+        normalization factors, detrending coefficients, ramp parameters.
 
     ecurves: 2D float array
-        Eigencurves that are used as the fitting basis for
-        the planet map.
+        Eigencurves used as the fitting basis for the planet map.
 
     t: 1D float array
-        ALL the times associated with this planet map. If the
-        map is being fit to multiple observations, this is
-        a concatenated array of those times.
+        All observation times.
 
     y00: 1D float array
-        The light curve contribution of the uniform map component.
-        Same size as t.
+        Uniform-map light curve contribution.
 
     sflux: 1D float array
-        The light curve contribution of the star (generally,
-        1 everywhere). Same size as t.
+        Stellar light curve contribution.
 
-    ncurves: Int
-        The number of eigencurves to use in the fit.
+    ncurves: int
+        Number of eigencurves.
 
-    intens: 2D float array
-        Precomputed eigenmap intensity, of size
-        (ncurves x nlocs), where nlocs is the number of locations
-        where the intensity has been precomputed. This array
-        is used to determine if a fit has negative intensities
-        on the map, and thus can be rejected. If intens is None,
-        the model will not check for negative intensities.
+    intens: 2D float array or None
+        Precomputed eigenmap intensities (ncurves x nlocs). When not None,
+        used to enforce positive flux at visible locations.
 
-    pindex: 2D boolean array
-        Indices used to divide params between the models. E.g.,
-        params[pindex[0]] pulls out the map parameters,
-        params[pindex[1]] pulls out the ramp parameters for the
-        first visit, etc.
+    pindex: 2D bool array
+        Boolean index array selecting parameters for each sub-model.
 
-    baselines: tuple of strings
-        Ramp models to use for each visit.
+    baselines: tuple of str
+        Ramp model names for each visit.
 
-    tlocs: list of 1D float arrays
-        Local time (relative to start of visit) for each visit.
-        Used for ramp model evaluation.
+    tlocs: tuple of 1D float arrays
+        Local time arrays for each visit.
 
-    dvecs: list of 2D float arrays
-        Detrending vectors for each visit. This can be things
-        like x-position, y-position, PSF-width, etc. Anything
-        you think might be correlated with your light curve.
+    dvecs: tuple of 2D float arrays
+        Detrending vectors for each visit.
     """
-
-    imodel = 0 # Keeps track of which model we are on
+    imodel = 0
     mparams = params[pindex[imodel]]
     imodel += 1
 
-    # Check for negative intensities
     if intens is not None:
         nloc = intens.shape[1]
         totint = np.zeros(nloc)
         for j in range(nloc):
-            # Weighted eigenmap intensity
-            totint[j] = np.sum(intens[:,j] * mparams[:ncurves])
-            # Contribution from uniform map
+            totint[j] = np.sum(intens[:, j] * mparams[:ncurves])
             totint[j] += mparams[ncurves] / np.pi
         if np.any(totint <= 0):
             f = np.ones(len(t)) * np.min(totint)
@@ -809,10 +797,8 @@ def fit_2d(params, ecurves, t, y00, sflux, ncurves, intens, pindex,
         f += ecurves[i] * mparams[i]
 
     f += mparams[ncurves] * y00
+    f += mparams[ncurves + 1]
 
-    f += mparams[ncurves+1]
-
-    # Renormalize (e.g., stellar variability between visits)
     istart = 0
     normparams = params[pindex[imodel]]
     imodel += 1
@@ -822,21 +808,18 @@ def fit_2d(params, ecurves, t, y00, sflux, ncurves, intens, pindex,
 
     f += sflux
 
-    # Apply detrending vectors
     alldvec = np.zeros(len(t))
     istart = 0
-    for dvec in dvecs:
+    for dvec in literal_unroll(dvecs):
         dmodel = np.ones(dvec.shape[1])
         for j, par in enumerate(params[pindex[imodel]]):
             dmodel += par * dvec[j]
-
         alldvec[istart:istart + dvec.shape[1]] += dmodel
         istart += dvec.shape[1]
         imodel += 1
 
     f *= alldvec
 
-    # Apply ramps
     allramp = np.zeros(len(t))
     istart = 0
     for bl, tloc, ipar in zip(baselines, tlocs, pindex[imodel:]):
@@ -846,7 +829,7 @@ def fit_2d(params, ecurves, t, y00, sflux, ncurves, intens, pindex,
         elif bl == 'linear':
             ramp = rparams[0] + rparams[1] * tloc
         elif bl == 'quadratic':
-            ramp = rparams[0] +  rparams[1] * (tloc - rparams[3])**2 + \
+            ramp = rparams[0] + rparams[1] * (tloc - rparams[3])**2 + \
                 rparams[2] * (tloc - rparams[3])
         elif bl == 'sinusoidal':
             ramp = rparams[0] + rparams[1] * np.sin(
@@ -855,8 +838,7 @@ def fit_2d(params, ecurves, t, y00, sflux, ncurves, intens, pindex,
             ramp = rparams[0] + rparams[1] * np.exp((-rparams[2] * tloc) + rparams[3])
         elif bl == 'linexp':
             ramp = rparams[0] + rparams[1] * tloc + rparams[2] * \
-                np.exp((1/rparams[3]) * -tloc)
-
+                np.exp((1 / rparams[3]) * -tloc)
         allramp[istart:istart + len(tloc)] += ramp
         istart += len(tloc)
 
@@ -867,50 +849,39 @@ def fit_2d(params, ecurves, t, y00, sflux, ncurves, intens, pindex,
 
 def get_par_2d(fit, d, ln):
     '''
-    Returns sensible parameter settings for each 2D model
+    Returns sensible parameter settings for each 2D model.
     '''
-    cfg = fit.cfg
-    
-    # Necessary parameters
     nmappar = ln.ncurves + 2
 
     params = np.zeros(nmappar)
     params[ln.ncurves] = 0.001
-    
-    pstep = np.ones(nmappar) *  0.01
+
+    pstep = np.ones(nmappar) * 0.01
     pmin  = np.ones(nmappar) * -1.0
     pmax  = np.ones(nmappar) *  1.0
 
-    pstep[ln.ncurves+1] = 0.0
+    pstep[ln.ncurves + 1] = 0.0
 
     pnames   = []
     texnames = []
     for j in range(ln.ncurves):
-        pnames.append("C{}".format(j+1))
-        texnames.append("$C_{{{}}}$".format(j+1))
+        pnames.append("C{}".format(j + 1))
+        texnames.append("$C_{{{}}}$".format(j + 1))
 
     pnames.append("C0")
     texnames.append("$C_0$")
-
     pnames.append("scorr")
     texnames.append("$s_{corr}$")
 
-    # Renormalize parameters
     nnormpar = len(d.visits)
-    params   = np.concatenate((params,   np.repeat(1.0,  nnormpar)))
-    pmin     = np.concatenate((pmin,     np.repeat(0.8,  nnormpar)))
-    pmax     = np.concatenate((pmax,     np.repeat(1.2,  nnormpar)))
-    pnames   = np.concatenate((pnames,   ['N{}'.format(i) for i in range(1, nnormpar+1)]))
-    texnames = np.concatenate((texnames, ['$N_{}$'.format(i) for i in range(1, nnormpar+1)]))
+    params   = np.concatenate((params,   np.repeat(1.0, nnormpar)))
+    pmin     = np.concatenate((pmin,     np.repeat(0.8, nnormpar)))
+    pmax     = np.concatenate((pmax,     np.repeat(1.2, nnormpar)))
+    pnames   = np.concatenate((pnames,   ['N{}'.format(i) for i in range(1, nnormpar + 1)]))
+    texnames = np.concatenate((texnames, ['$N_{}$'.format(i) for i in range(1, nnormpar + 1)]))
     for v in d.visits:
-        # Free parameter for renormalized visits,
-        # fixed to 1.0 for non-remornalized visits.
-        if v.renormalize:
-            pstep = np.concatenate((pstep, (0.01,)))
-        else:
-            pstep = np.concatenate((pstep, (0.0,)))
+        pstep = np.concatenate((pstep, (0.01,) if v.renormalize else (0.0,)))
 
-    # Detrending vector coefficients
     ndvecpar = []
     for v in d.visits:
         if v.detrend:
@@ -919,91 +890,185 @@ def get_par_2d(fit, d, ln):
             pstep    = np.concatenate((pstep,    np.repeat(0.1, npar)))
             pmin     = np.concatenate((pmin,     np.repeat(-np.inf, npar)))
             pmax     = np.concatenate((pmax,     np.repeat( np.inf, npar)))
-            pnames   = np.concatenate((pnames,   ['d{}'.format(i) for i in range(1, npar+1)]))
-            texnames = np.concatenate((texnames, ['$d_{}$'.format(i) for i in range(1, npar+1)]))
+            pnames   = np.concatenate((pnames,   ['d{}'.format(i) for i in range(1, npar + 1)]))
+            texnames = np.concatenate((texnames, ['$d_{}$'.format(i) for i in range(1, npar + 1)]))
         else:
             npar = 0
-
         ndvecpar.append(npar)
-    
-    nramppar = []
 
-    # Parse baseline models
+    nramppar = []
     for v in d.visits:
         if v.baseline == 'none':
             npar = 0
         elif v.baseline == 'linear':
-            params   = np.concatenate((params,   (1.0, 0.0,)))
-            pstep    = np.concatenate((pstep,    (0.01, 0.001,)))
-            pmin     = np.concatenate((pmin,     (0.8, -np.inf,)))
-            pmax     = np.concatenate((pmax,     (1.2, np.inf,)))
-            pnames   = np.concatenate((pnames,   ('b', 'm',)))
-            texnames = np.concatenate((texnames, ('$b$', '$m$',)))
+            params   = np.concatenate((params,   (1.0, 0.0)))
+            pstep    = np.concatenate((pstep,    (0.01, 0.001)))
+            pmin     = np.concatenate((pmin,     (0.8, -np.inf)))
+            pmax     = np.concatenate((pmax,     (1.2,  np.inf)))
+            pnames   = np.concatenate((pnames,   ('b', 'm')))
+            texnames = np.concatenate((texnames, ('$b$', '$m$')))
             npar = 2
         elif v.baseline == 'quadratic':
-            params   = np.concatenate((params,   (1.0, 0.0,  0.0,   0.0)))
-            pstep    = np.concatenate((pstep,    (0.01, 0.01, 0.01,  0.0)))
-            pmin     = np.concatenate((pmin,     (0.8, -1.0,  -1.0, -np.inf)))
-            pmax     = np.concatenate((pmax,     (1.2, 1.0,   1.0,  np.inf)))
-            pnames   = np.concatenate((pnames,   ('r0', 'r1',  'r2', 't0')))
+            params   = np.concatenate((params,   (1.0, 0.0,  0.0,  0.0)))
+            pstep    = np.concatenate((pstep,    (0.01, 0.01, 0.01, 0.0)))
+            pmin     = np.concatenate((pmin,     (0.8, -1.0, -1.0, -np.inf)))
+            pmax     = np.concatenate((pmax,     (1.2,  1.0,  1.0,  np.inf)))
+            pnames   = np.concatenate((pnames,   ('r0', 'r1', 'r2', 't0')))
             texnames = np.concatenate((texnames, ('r_0', '$r_1$', '$r_2$', '$t_0$')))
             npar = 3
         elif v.baseline == 'sinusoidal':
             params   = np.concatenate((params,   (1.0, -3.6e-5, 0.0885, 2.507)))
-            pstep    = np.concatenate((pstep,    (0.01, 0.001, 0.001,    0.1)))
-            pmin     = np.concatenate((pmin,     (0.8, -1.0,  0.05, -np.pi)))
-            pmax     = np.concatenate((pmax,     (1.2, 1.0,  0.15,  np.pi)))
+            pstep    = np.concatenate((pstep,    (0.01, 0.001, 0.001, 0.1)))
+            pmin     = np.concatenate((pmin,     (0.8, -1.0, 0.05, -np.pi)))
+            pmax     = np.concatenate((pmax,     (1.2,  1.0, 0.15,  np.pi)))
             pnames   = np.concatenate((pnames,   ('b', 'Amp.', 'Period', 'Phase')))
             texnames = np.concatenate((texnames, ('$b$', 'Amp.', 'Period', 'Phase')))
             npar = 4
-        elif v.baseline == 'exponential':    
+        elif v.baseline == 'exponential':
             params   = np.concatenate((params,   (1.0, 0.00001, 0.00001, 0.00001)))
-            pstep    = np.concatenate((pstep,    (0.01, 0.01, 0.01,    0.01)))
-            pmin     = np.concatenate((pmin,     (0.8, -5,  -5, -5)))
-            pmax     = np.concatenate((pmax,     (1.2, 30, 30,  30))) 
-            pnames   = np.concatenate((pnames,   ('r0', 'r1', 'r2', 'r3'))) 
+            pstep    = np.concatenate((pstep,    (0.01, 0.01, 0.01, 0.01)))
+            pmin     = np.concatenate((pmin,     (0.8, -5, -5, -5)))
+            pmax     = np.concatenate((pmax,     (1.2, 30, 30, 30)))
+            pnames   = np.concatenate((pnames,   ('r0', 'r1', 'r2', 'r3')))
             texnames = np.concatenate((texnames, ('$r_0$', '$r_1$', '$r_2$', '$r_3$')))
             npar = 4
         elif v.baseline == 'linexp':
-            params   = np.concatenate((params,   (1.0, -0.00219881,0.00010304,0.01629347)))
+            params   = np.concatenate((params,   (1.0, -0.00219881, 0.00010304, 0.01629347)))
             pstep    = np.concatenate((pstep,    (0.01, 0.001, 0.001, 0.001)))
             pmin     = np.concatenate((pmin,     (0.8, -1, -0.01, 0.0)))
-            pmax     = np.concatenate((pmax,     (1.2, 1, 0.01, 0.2)))
+            pmax     = np.concatenate((pmax,     (1.2,  1,  0.01, 0.2)))
             pnames   = np.concatenate((pnames,   ('b', 'm', 'A', 'tau')))
             texnames = np.concatenate((texnames, ('$b$', '$m$', '$A$', '$\\tau$')))
             npar = 4
         else:
             print("Unrecognized baseline model.")
             sys.exit()
-
         nramppar.append(npar)
 
-    npar = np.concatenate(([nmappar], [nnormpar], ndvecpar, nramppar))
-    totpar = np.sum(npar)
-    cumpar = np.cumsum(npar)
-
-    # Map model, normalization model, detrend model (per visit), ramp model (per visit)
-    nmodel = 2 + 2 * len(d.visits)
-
-    pindex = np.zeros((nmodel, totpar), dtype=bool)
-
-    istart = 0
-    for i in range(nmodel):
-        where = np.where((np.arange(totpar) >= istart) &
-                         (np.arange(totpar) <  cumpar[i]))
-        pindex[i][where] = True
-        istart += npar[i]
+    npars   = [nmappar, nnormpar] + ndvecpar + nramppar
+    nparams = len(params)
+    pindex  = np.zeros((len(npars), nparams))
+    for i, npar in enumerate(npars):
+        start = int(np.sum(npars[:i]))
+        pindex[i, start:start + npar] = True
+    pindex = pindex.astype(bool)
 
     return params, pstep, pmin, pmax, pnames, texnames, pindex
 
+
+def mkcurves_vary(system, t, lmax, y00, ncurves=None, method='pca', obl=0, p_inc=0,
+                  orbcheck=None, sigorb=None):
+    """
+    Generates light curves from a star+planet system at times t,
+    for positive and negative spherical harmonics with l up to lmax,
+    with a specified obliquity and planet inclination.
+
+    Arguments
+    ---------
+    system: SurfaceSystem
+        A jaxoplanet SurfaceSystem with a star and planet.
+
+    t: 1D array
+        Array of times at which to calculate eigencurves.
+
+    lmax: int
+        Maximum l to use in spherical harmonic maps.
+
+    y00: 1D array
+        Light curve of a normalized, uniform map.
+
+    obl: float
+        Obliquity of the planet in radians.
+
+    p_inc: float
+        Planet surface inclination in radians.
+
+    Returns
+    -------
+    eigeny, evalues, evectors, proj, lcs
+        Same format as mkcurves.
+    """
+    planet_surface = system.body_surfaces[0]
+    planet_body = system.bodies[0]
+    central = system.central
+    central_surface = system.central_surface
+
+    nt = len(t)
+
+    def evalflux(yval):
+        n_coeffs = (lmax + 1)**2
+        ylm_coeffs = jnp.zeros(n_coeffs)
+        ylm_coeffs = ylm_coeffs.at[0].set(1.0)
+        ylm_coeffs = ylm_coeffs.at[1:].set(yval)
+        new_ylm = Ylm.from_dense(ylm_coeffs, normalize=True)
+        new_planet_surface = Surface(
+            y=new_ylm,
+            inc=p_inc,
+            period=planet_surface.period,
+            radius=planet_surface.radius,
+            u=(),
+            normalize=False,
+            amplitude=1.0,
+            phase=planet_surface.phase,
+            obl=obl,
+        )
+        new_system = SurfaceSystem(central=central, central_surface=central_surface)
+        new_system = new_system.add_body(
+            period=planet_body.period,
+            radius=planet_body.radius,
+            mass=planet_body.mass,
+            inclination=planet_body.inclination,
+            eccentricity=planet_body.eccentricity,
+            omega_peri=planet_body.omega_peri,
+            time_transit=planet_body.time_transit,
+            surface=new_planet_surface,
+        )
+        flux_result = light_curve(new_system, order=100)(t)
+        return np.array(flux_result.T[0]), np.array(flux_result.T[1])
+
+    nharm = 2 * ((lmax + 1)**2 - 1)
+    lcs = np.zeros((nharm, nt))
+    ilc = 0
+
+    for l in range(1, lmax + 1):
+        for m in range(-l, l + 1):
+            yval = np.zeros(nharm // 2)
+            yval[ilc // 2] = 1.0
+            _, lcs[ilc] = evalflux(yval)
+            lcs[ilc + 1] = lcs[ilc].copy()
+            lcs[ilc + 1] -= y00
+            ilc += 2
+
+    if orbcheck is not None:
+        print("Warning: orbcheck not yet implemented for jaxoplanet, skipping...")
+
+    lcs -= y00
+
+    if ncurves is None:
+        ncurves = nharm
+        if method == 'tsvd':
+            ncurves -= 1
+
+    evalues, evectors, proj = pca.pca(lcs, method=method, ncomp=ncurves)
+    proj = np.real(proj)
+
+    eigeny = np.zeros((ncurves, (lmax + 1)**2))
+    eigeny[:, 0] = 1.0
+    for j in range(ncurves):
+        yi  = 1
+        shi = 0
+        for l in range(1, lmax + 1):
+            for m in range(-l, l + 1):
+                eigeny[j, yi] = evectors.T[j, shi] - evectors.T[j, shi + 1]
+                yi  += 1
+                shi += 2
+
+    return eigeny, evalues, evectors, proj, lcs
+
+
 def main():
     fit = dummyfit.create_dummy_fit()
-
     star_surface, planet_surface, system = initsystem(fit, 3)
-    #print(system.t)
 
-
-
-    
 
 main()

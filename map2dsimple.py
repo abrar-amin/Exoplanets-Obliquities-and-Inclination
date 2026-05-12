@@ -3,19 +3,25 @@
 Simplified map2d using jaxoplanet - only computes positions at observation times
 """
 
+
+# Try changing the inclination and keep obliquity constant () 
+# make a gif with planet revoling around star 
+
 import sys
 import os
 
-# Set matplotlib to non-interactive backend to prevent plot windows from opening
 import matplotlib
 
 
 import jax.numpy as jnp
 from jaxoplanet.starry.light_curves import light_curve
+from jaxoplanet.starry.surface import Surface
+from jaxoplanet.starry.ylm import Ylm
+from jaxoplanet.starry.visualization import show_surface
 import numpy as np
 import mc3
 import time
-# import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt
 
 # Add lib directory to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -218,6 +224,10 @@ def map2d(cfile):
             m.flux      = d.flux[i]
             m.ferr      = d.ferr[i]
 
+            m.subdir = '{}-filt{}'.format(d.name, i + 1)
+            if not os.path.isdir(os.path.join(cfg.twod.outdir, m.subdir)):
+                os.mkdir(os.path.join(cfg.twod.outdir, m.subdir))
+
 
             minbic = jnp.inf
 
@@ -260,18 +270,136 @@ def map2d(cfile):
                     ncomp = ln.ncurves
                     if ln.ncurves == 0:
                         ncomp = None
-
+                    #utils_jax.eval_obliquities(system_ln, d.t, ln.lmax,
+                                         # d.pflux_y00)
+                    
+                #    utils_jax.eval_inclination(system_ln, d.t, ln.lmax,
+                                         # d.pflux_y00)
+                    
                     # Call mkcurves from our jaxoplanet version in temp.py
-                    t_mkcurves_start = time.time()
-                    ln.eigeny, ln.evalues, ln.evectors, ln.ecurves, ln.lcs = \
-                        utils_jax.mkcurves(system_ln, d.t, ln.lmax,
+                    #ln.eigeny, ln.evalues, ln.evectors, ln.ecurves, ln.lcs = \
+                        #utils_jax.mkcurves(system_ln, d.t, ln.lmax,
+                         #                 d.pflux_y00, ncurves=ncomp,
+                          #                method=cfg.twod.pca,
+                           #            orbcheck=cfg.twod.orbcheck,
+                            #              sigorb=cfg.twod.sigorb)
+                    
+                  #  for i in range(len(ln.ecurves)):
+                   #         plt.title("actual")
+                    #        plt.plot(ln.ecurves[i])
+
+                  #  plt.show()
+                    if(n < 2 or l < 2 ):
+                        continue 
+                    p_inc = 0
+                    planet_surface_ln = system_ln.body_surfaces[0]
+                    n_coeffs = (ln.lmax + 1) ** 2
+
+                    results = []
+                    for oi in range(10):
+                        obl = (oi / 9) * 3.14159
+                        obl_deg = obl * (180 / 3.14159)
+                        print("lmax=" + str(ln.lmax) + f"  obl={obl_deg:.1f}°")
+
+                        ln.eigeny, ln.evalues, ln.evectors, ln.ecurves, ln.lcs = \
+                        utils_jax.mkcurves_vary(system_ln, d.t, ln.lmax,
                                           d.pflux_y00, ncurves=ncomp,
                                           method=cfg.twod.pca,
                                           orbcheck=cfg.twod.orbcheck,
-                                          sigorb=cfg.twod.sigorb)
-                    t_mkcurves_elapsed = time.time() - t_mkcurves_start
-                    print("      PCA/mkcurves took {:.3f}s".format(t_mkcurves_elapsed))
+                                          sigorb=cfg.twod.sigorb, p_inc=p_inc, obl=float(obl))
 
+                        ylm_coeffs = jnp.array(ln.eigeny[1]) if len(ln.eigeny) > 0 else jnp.zeros(n_coeffs)
+                        new_ylm = Ylm.from_dense(ylm_coeffs, normalize=False)
+                        surf = Surface(
+                            y=new_ylm,
+                            inc=planet_surface_ln.inc,
+                            period=planet_surface_ln.period,
+                            radius=planet_surface_ln.radius,
+                            u=(),
+                            normalize=False,
+                            amplitude=1.0,
+                            phase=planet_surface_ln.phase,
+                            obl=float(obl),
+                        )
+                        results.append((obl_deg, ln.ecurves.copy(), surf))
+
+                    fig1, axes1 = plt.subplots(2, 5,
+                               figsize=(4 * 5, 3 * 2), squeeze=False)
+                    fig1.suptitle(f" lmax = {l} | n curves = {n} | Light Curves vs Obliquity  |  p_inc={p_inc * (180/3.14159):.1f}°")
+                    fig2, axes2 = plt.subplots(2, 5,
+                               figsize=(3 * 5, 3 * 2), squeeze=False)
+                    fig2.suptitle(f" lmax = {l} | n curves = {n} | Obliquities vs Surface  |  p_inc={p_inc * (180/3.14159):.1f}°")
+
+                    for oi, (obl_deg, ecurves, surf) in enumerate(results):
+                        ax = axes1[oi // 5][oi % 5]
+                        for ci in range(len(ecurves)):
+                            ax.plot(d.t, ecurves[ci])
+                        ax.set_title(f"obl={obl_deg:.1f}°")
+                        ax.set_xlabel("Time (days)")
+                        ax.set_ylabel("ΔFlux")
+
+                        ax2 = axes2[oi // 5][oi % 5]
+                        show_surface(surf, ax=ax2, theta=0)
+                        ax2.set_title(f"obl={obl_deg:.1f}°")
+
+                    fig1.tight_layout()
+                    fig2.tight_layout()
+                    plt.show()
+
+                    obl = 0
+                    inc_results = []
+                    for ii in range(10):
+                        p_inc = (ii / 9) * 3.14159
+                        inc_deg = p_inc * (180 / 3.14159)
+                        print("lmax=" + str(ln.lmax) + f"  inc={inc_deg:.1f}°")
+
+                        ln.eigeny, ln.evalues, ln.evectors, ln.ecurves, ln.lcs = \
+                        utils_jax.mkcurves_vary(system_ln, d.t, ln.lmax,
+                                          d.pflux_y00, ncurves=ncomp,
+                                          method=cfg.twod.pca,
+                                          orbcheck=cfg.twod.orbcheck,
+                                          sigorb=cfg.twod.sigorb, p_inc=float(p_inc), obl=obl)
+
+                        ylm_coeffs = jnp.array(ln.eigeny[1]) if len(ln.eigeny) > 0 else jnp.zeros(n_coeffs)
+                        new_ylm = Ylm.from_dense(ylm_coeffs, normalize=False)
+                        surf = Surface(
+                            y=new_ylm,
+                            inc=float(p_inc),
+                            period=planet_surface_ln.period,
+                            radius=planet_surface_ln.radius,
+                            u=(),
+                            normalize=False,
+                            amplitude=1.0,
+                            phase=planet_surface_ln.phase,
+                            obl=obl,
+                        )
+                        inc_results.append((inc_deg, ln.ecurves.copy(), surf))
+
+                    fig3, axes3 = plt.subplots(2, 5,
+                               figsize=(4 * 5, 3 * 2), squeeze=False)
+                    fig3.suptitle(f" lmax = {l} | n curves = {n} | Light Curves vs Inclination  |  obl={obl * (180/3.14159):.1f}°")
+                    fig4, axes4 = plt.subplots(2, 5,
+                               figsize=(3 * 5, 3 * 2), squeeze=False)
+                    fig4.suptitle(f" lmax = {l} | n curves = {n} | Inclination vs Surface  |  obl={obl * (180/3.14159):.1f}°")
+
+                    for ii, (inc_deg, ecurves, surf) in enumerate(inc_results):
+                        ax = axes3[ii // 5][ii % 5]
+                        for ci in range(len(ecurves)):
+                            ax.plot(d.t, ecurves[ci])
+                        ax.set_title(f"inc={inc_deg:.1f}°")
+                        ax.set_xlabel("Time (days)")
+                        ax.set_ylabel("ΔFlux")
+
+                        ax4 = axes4[ii // 5][ii % 5]
+                        show_surface(surf, ax=ax4, theta=0)
+                        ax4.set_title(f"inc={inc_deg:.1f}°")
+
+                    fig3.tight_layout()
+                    fig4.tight_layout()
+                    plt.show()
+
+                    continue
+                
                     print("    Calculating intensities of visible grid cells of each eigenmap...")
                     t_intens_start = time.time()
                     ln.intens, ln.vislat, ln.vislon = \
@@ -306,6 +434,7 @@ def map2d(cfile):
                         continue
 
                     # Set up for MCMC
+                    return 
 
                     if cfg.twod.posflux:
                         intens = ln.intens
@@ -497,26 +626,7 @@ def map2d(cfile):
     t_start = time.time()
     for d in fit.datasets:
         for m in d.maps:
-            star_surface, planet_surface, system_ln = utils_jax.initsystem(fit, m.bestln.lmax)
-            # These are used or not used in mkmaps depending on the type
-            # of stellar spectrum set in the configuration.
-            fwl    = m.filtwl
-            ftrans = m.filttrans
-            swl    = fit.starwl if hasattr(fit, 'starwl') else None
-            sspec  = fit.starflux if hasattr(fit, 'starflux') else None
-
-            # Convert lat/lon from degrees to radians for jaxoplanet
-            lat_rad = jnp.deg2rad(fit.lat)
-            lon_rad = jnp.deg2rad(fit.lon)
-
-            fmap, tmap = utils_jax.mkmaps(planet_surface, m.bestln.eigeny,
-                                      m.bestln.bestp,
-                                      m.bestln.ncurves, m.wlmid,
-                                      cfg.star.r, cfg.planet.r,
-                                      cfg.star.t, lat_rad, lon_rad,
-                                      starspec=cfg.star.starspec,
-                                      fwl=fwl, ftrans=ftrans, swl=swl,
-                                      sspec=sspec)
+            fmap, tmap = utils_jax.mkmaps(fit, m, m.bestln, m.bestln.bestp)
             m.fmap = fmap
             m.tmap = tmap
     t_elapsed = time.time() - t_start
@@ -608,7 +718,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     # Run simplified map2d
-    fit, system = map2d(cfile)
+    map2d(cfile)
 
     print("\n" + "="*60)
     print("INTERACTIVE MODE")
@@ -626,3 +736,19 @@ if __name__ == "__main__":
     print("  system.body_surfaces[0]  - Planet surface")
     print("  system.central           - Star")
     print("  system.central_surface   - Star surface")
+
+
+# TODO: 
+# - Fix up plots so that it generates ... 
+# - Give it fake data to see the effects of inclination after running Theresa
+#       - Get light curves from jaxoplanet
+# - Add white noise and inject fake data and then run into theresa 
+# - Look at with inclincation vs. without inclination
+#    - Maybe look at real data and looking at existing publications
+
+
+# - Synthetic data injection 
+# Create python script for the above ^^
+# Play around with hotspot (making hotspot) (different harmonic weights)
+    # play around do it based on intution 
+    
